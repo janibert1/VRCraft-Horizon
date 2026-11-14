@@ -872,6 +872,14 @@ pub type PfnGetVulkanGraphicsRequirements2KHR = unsafe extern "system" fn(
     system_id: XrSystemId,
     requirements: *mut XrGraphicsRequirementsVulkan2KHR,
 ) -> XrResult;
+/// `xrGetVulkanGraphicsDeviceKHR` (legacy `XR_KHR_vulkan_enable`). The requirements function of
+/// the legacy extension has the same signature and struct layout as the enable2 one.
+pub type PfnGetVulkanGraphicsDeviceLegacyKHR = unsafe extern "system" fn(
+    instance: XrInstance,
+    system_id: XrSystemId,
+    vulkan_instance: u64,
+    vulkan_physical_device: *mut u64,
+) -> XrResult;
 pub type PfnBeginSession = unsafe extern "system" fn(
     session: XrSession,
     begin_info: *const XrSessionBeginInfo,
@@ -960,6 +968,10 @@ pub struct OpenXrProcs {
     pub create_session: PfnCreateSession,
     pub get_vulkan_graphics_device2: Option<PfnGetVulkanGraphicsDevice2KHR>,
     pub get_vulkan_graphics_requirements2: Option<PfnGetVulkanGraphicsRequirements2KHR>,
+    /// Legacy `XR_KHR_vulkan_enable` calls (Monado/WiVRn only accept an app-created
+    /// VkInstance through these, see `create_session_with_vulkan`).
+    pub get_vulkan_graphics_device_legacy: Option<PfnGetVulkanGraphicsDeviceLegacyKHR>,
+    pub get_vulkan_graphics_requirements_legacy: Option<PfnGetVulkanGraphicsRequirements2KHR>,
     pub destroy_session: PfnDestroySession,
     pub begin_session: PfnBeginSession,
     pub end_session: PfnEndSession,
@@ -1207,6 +1219,9 @@ pub struct XrContext {
     pub swapchain_size: Option<(u32, u32)>,
     /// The swapchain image index each eye acquired this frame (None: not acquired).
     pub acquired_image_index: [Option<u32>; 2],
+    /// Bit per eye: its swapchain image was acquired AND released since the last `end_frame`. A projection layer may
+    /// only reference swapchains whose image was released (else XR_ERROR_LAYER_INVALID).
+    pub released_eyes: u8,
     /// Which eye this game frame renders (0 = left, 1 = right). The render
     /// hook's second pass switches it so the whole engine renders the right
     /// eye's view before `world_drawn` copies it into the right eye texture.
@@ -1320,6 +1335,7 @@ impl XrContext {
                     frame_state: None,
                     swapchain_size: None,
                     acquired_image_index: [None, None],
+                    released_eyes: 0,
                     stereo_eye_select: 0,
                     stereo_right_done: false,
                     system_id,
@@ -1356,6 +1372,7 @@ impl XrContext {
                     frame_state: None,
                     swapchain_size: None,
                     acquired_image_index: [None, None],
+                    released_eyes: 0,
                     stereo_eye_select: 0,
                     stereo_right_done: false,
                     system_id: XR_NULL_SYSTEM_ID,
@@ -1815,6 +1832,8 @@ impl XrContext {
                 create_session: load_pfn(&lib, get_proc, instance, c"xrCreateSession")?,
                 get_vulkan_graphics_device2: opt_pfn(&lib, get_proc, instance, c"xrGetVulkanGraphicsDevice2KHR"),
                 get_vulkan_graphics_requirements2: opt_pfn(&lib, get_proc, instance, c"xrGetVulkanGraphicsRequirements2KHR"),
+                get_vulkan_graphics_device_legacy: opt_pfn(&lib, get_proc, instance, c"xrGetVulkanGraphicsDeviceKHR"),
+                get_vulkan_graphics_requirements_legacy: opt_pfn(&lib, get_proc, instance, c"xrGetVulkanGraphicsRequirementsKHR"),
                 destroy_session: load_pfn(&lib, get_proc, instance, c"xrDestroySession")?,
                 begin_session: load_pfn(&lib, get_proc, instance, c"xrBeginSession")?,
                 end_session: load_pfn(&lib, get_proc, instance, c"xrEndSession")?,
@@ -1914,7 +1933,12 @@ impl XrContext {
             log::warn!(target: "horizon_vivecraft", "[ViveCraft] xrGetVulkanGraphicsRequirements2KHR not exported; trying anyway");
         }
 
-        if let Some(get_dev) = procs.get_vulkan_graphics_device2 {
+        // VRCRAFT_VULKAN_ENABLE=legacy forces the legacy path, =2 forbids it (default: try enable2, fall back).
+        let force = std::env::var("VRCRAFT_VULKAN_ENABLE").unwrap_or_default();
+        let mut device_ok = false;
+        if force == "legacy" {
+            // skip the enable2 device call
+        } else if let Some(get_dev) = procs.get_vulkan_graphics_device2 {
             let get_info = XrVulkanGraphicsDeviceGetInfoKHR {
                 ty: XrStructureType::VulkanGraphicsDeviceGetInfoKHR,
                 next: ptr::null(),
@@ -1930,10 +1954,37 @@ impl XrContext {
                 log::warn!(target: "horizon_vivecraft",
                     "[ViveCraft] runtime wants physical device {runtime_phys:#x} but wgpu uses {vk_physical_device:#x}; session create may fail");
             } else {
+                device_ok = true;
                 log::warn!(target: "horizon_vivecraft", "[ViveCraft] xrGetVulkanGraphicsDevice2KHR ok (physical device {runtime_phys:#x})");
             }
         } else {
             log::warn!(target: "horizon_vivecraft", "[ViveCraft] xrGetVulkanGraphicsDevice2KHR not exported by the runtime; trying the session create anyway");
+        }
+
+        // Monado and WiVRn answer xrGetVulkanGraphicsDevice2KHR with XR_ERROR_VALIDATION_FAILURE for a VkInstance
+        // that was not created through xrCreateVulkanInstanceKHR (their vk_get_instance_proc_addr stays NULL).
+        // wgpu creates its own instance, so use the legacy XR_KHR_vulkan_enable calls, which take any VkInstance.
+        // The binding struct and the requirements struct have identical type ids and layout in both extensions.
+        if !device_ok && force != "2" {
+            if let (Some(get_req), Some(get_dev)) = (procs.get_vulkan_graphics_requirements_legacy, procs.get_vulkan_graphics_device_legacy) {
+                let mut reqs = XrGraphicsRequirementsVulkan2KHR {
+                    ty: XrStructureType::VulkanGraphicsRequirementsKHR,
+                    next: ptr::null(),
+                    min_api_version_supported: 0,
+                    max_api_version_supported: 0,
+                };
+                // SAFETY: valid output struct against the live instance/system.
+                let r1 = unsafe { get_req(self.instance, self.system_id, &mut reqs) };
+                let mut runtime_phys: u64 = 0;
+                // SAFETY: vk_instance is the live VkInstance wgpu created.
+                let r2 = unsafe { get_dev(self.instance, self.system_id, vk_instance, &mut runtime_phys) };
+                if r1 >= XR_SUCCESS && r2 >= XR_SUCCESS {
+                    log::warn!(target: "horizon_vivecraft",
+                        "[ViveCraft] legacy XR_KHR_vulkan_enable ok (physical device {runtime_phys:#x}, wgpu {vk_physical_device:#x})");
+                } else {
+                    log::warn!(target: "horizon_vivecraft", "[ViveCraft] legacy xrGetVulkanGraphicsRequirementsKHR/DeviceKHR failed ({r1}/{r2})");
+                }
+            }
         }
 
         let session_create_info = XrSessionCreateInfo {
@@ -2110,36 +2161,40 @@ impl XrContext {
                 continue;
             };
             let a = &self.actions;
-            let suggestions: [(XrAction, &CStr, &CStr); 10] = [
-                (a.aim_pose_action, c"/pose/aim", c"/pose/aim"),
-                (a.grip_pose_action, c"/pose/grip", c"/pose/grip"),
-                (a.trigger_action, c"/trigger/value", c"/trigger/value"),
-                (a.squeeze_action, c"/squeeze/value", c"/squeeze/value"),
-                (a.thumbstick_action, c"/thumbstick", c"/thumbstick"),
-                (a.thumbstick_click_action, c"/thumbstick/click", c"/thumbstick/click"),
-                (a.button_primary_action, c"/a/click", c"/x/click"),
-                (a.button_secondary_action, c"/b/click", c"/y/click"),
-                (a.button_menu_action, c"/menu/click", c"/menu/click"),
-                (a.haptic_action, c"/output/haptic", c"/output/haptic"),
+            // (action, right-hand path, left-hand path); None = the profile has no such input.
+            // A single invalid path makes the runtime reject the WHOLE suggestion (XR_ERROR_PATH_UNSUPPORTED), so each
+            // profile only lists paths it defines: pose paths are /input/aim/pose and /input/grip/pose, the simple
+            // controller has only select/menu, Index has A/B on both hands (no X/Y, no menu), Touch has A/B right,
+            // X/Y left and the menu button on the left controller only.
+            let simple = profile == c"/interaction_profiles/khr/simple_controller";
+            let touch = profile == c"/interaction_profiles/oculus/touch_controller";
+            let both = |p: &'static CStr| (Some(p), Some(p));
+            let none: (Option<&'static CStr>, Option<&'static CStr>) = (None, None);
+            let suggestions: [(XrAction, (Option<&CStr>, Option<&CStr>)); 10] = [
+                (a.aim_pose_action, both(c"/input/aim/pose")),
+                (a.grip_pose_action, both(c"/input/grip/pose")),
+                (a.trigger_action, if simple { both(c"/input/select/click") } else { both(c"/input/trigger/value") }),
+                (a.squeeze_action, if simple { none } else { both(c"/input/squeeze/value") }),
+                (a.thumbstick_action, if simple { none } else { both(c"/input/thumbstick") }),
+                (a.thumbstick_click_action, if simple { none } else { both(c"/input/thumbstick/click") }),
+                (a.button_primary_action, if simple { none } else if touch { (Some(c"/input/a/click"), Some(c"/input/x/click")) } else { both(c"/input/a/click") }),
+                (a.button_secondary_action, if simple { none } else if touch { (Some(c"/input/b/click"), Some(c"/input/y/click")) } else { both(c"/input/b/click") }),
+                (a.button_menu_action, if simple { both(c"/input/menu/click") } else if touch { (None, Some(c"/input/menu/click")) } else { none }),
+                (a.haptic_action, both(c"/output/haptic")),
             ];
             let mut bindings: Vec<XrActionSuggestedBinding> = Vec::with_capacity(20);
             for (right_hand, left_hand) in HANDS {
-                for &(action, right_suffix, left_suffix) in &suggestions {
+                for &(action, (right_suffix, left_suffix)) in &suggestions {
                     if action == XR_NULL_HANDLE {
                         continue;
                     }
-                    // One binding per hand (the actions carry both hand
-                    // subaction paths): right hand gets the right suffix,
-                    // left hand the left suffix.
-                    let right_full =
-                        format!("{}{}{}\0", right_hand.to_string_lossy(), "/input", right_suffix.to_string_lossy());
-                    let left_full =
-                        format!("{}{}{}\0", left_hand.to_string_lossy(), "/input", left_suffix.to_string_lossy());
-                    if let Some(binding) = resolve_path(procs, self.instance, &right_full) {
-                        bindings.push(XrActionSuggestedBinding { action, binding });
-                    }
-                    if let Some(binding) = resolve_path(procs, self.instance, &left_full) {
-                        bindings.push(XrActionSuggestedBinding { action, binding });
+                    // One binding per hand (the actions carry both hand subaction paths).
+                    for (hand, suffix) in [(right_hand, right_suffix), (left_hand, left_suffix)] {
+                        let Some(suffix) = suffix else { continue };
+                        let full = format!("{}{}\0", hand.to_string_lossy(), suffix.to_string_lossy());
+                        if let Some(binding) = resolve_path(procs, self.instance, &full) {
+                            bindings.push(XrActionSuggestedBinding { action, binding });
+                        }
                     }
                 }
             }
@@ -2734,10 +2789,15 @@ impl XrContext {
                 let mut formats: Vec<i64> = vec![0; count as usize];
                 let res = unsafe { enumerate(self.session, count, &mut count, formats.as_mut_ptr()) };
                 if res >= XR_SUCCESS {
-                    format = *formats
+                    // Horizon's colour target is BGRA8: wgpu only allows a texture copy between formats that
+                    // differ in sRGB-ness, so BGRA8_SRGB (37) must win over RGBA8_SRGB (50) even when the
+                    // runtime lists 50 first (Monado does); with only 50 offered the blit cannot work (needs a draw).
+                    format = formats
                         .iter()
-                        .find(|f| **f == 37 || **f == 50)
-                        .unwrap_or(&formats[0]);
+                        .copied()
+                        .find(|f| *f == 37)
+                        .or_else(|| formats.iter().copied().find(|f| *f == 50))
+                        .unwrap_or(formats[0]);
                 }
             }
         }
@@ -2774,7 +2834,8 @@ impl XrContext {
             // XrSwapchainImageVulkan2KHR is larger than the base header, so each
             // slot gets capacity for the largest known layout.
             if let Some(enumerate_images) = procs.enumerate_swapchain_images {
-                const IMAGE_STRUCT_CAPACITY: usize = 64;
+                // sizeof(XrSwapchainImageVulkanKHR) = type(4)+pad(4)+next(8)+image(8) = 24: the runtime writes the array with this stride.
+        const IMAGE_STRUCT_CAPACITY: usize = 24;
                 let mut image_count: u32 = 0;
                 unsafe { enumerate_images(swapchain, 0, &mut image_count, ptr::null_mut()) };
                 let mut raw: Vec<u8> = vec![0u8; image_count as usize * IMAGE_STRUCT_CAPACITY];
@@ -2909,6 +2970,11 @@ impl XrContext {
             if self.swapchains[eye] == XR_NULL_HANDLE {
                 continue;
             }
+            // Idempotent: the stereo hook and a nested menu pass may both ask within one frame; acquiring an image
+            // that is still held fails (and waiting twice is a call-order error).
+            if self.acquired_image_index[eye].is_some() {
+                continue;
+            }
             if let Some(acquire) = procs.acquire_swapchain_image {
                 let mut index: u32 = 0;
                 let acquire_info = XrSwapchainImageAcquireInfo {
@@ -2954,6 +3020,7 @@ impl XrContext {
             if self.acquired_image_index[eye].take().is_none() {
                 continue;
             }
+            self.released_eyes |= 1 << eye;
             if let Some(release) = procs.release_swapchain_image {
                 let release_info = XrSwapchainImageReleaseInfo {
                     ty: XrStructureType::SwapchainImageReleaseInfo,
@@ -2971,7 +3038,8 @@ impl XrContext {
     /// handle sits at offset 16 after the base header.
     pub fn vulkan_image_handle(&self, eye: usize) -> Option<u64> {
         let index = self.acquired_image_index.get(eye).copied().flatten()? as usize;
-        const IMAGE_STRUCT_CAPACITY: usize = 64;
+        // sizeof(XrSwapchainImageVulkanKHR) = type(4)+pad(4)+next(8)+image(8) = 24: the runtime writes the array with this stride.
+        const IMAGE_STRUCT_CAPACITY: usize = 24;
         let raw = self.swapchain_images.get(eye)?;
         let offset = index.checked_mul(IMAGE_STRUCT_CAPACITY)?.checked_add(16)?;
         let bytes: [u8; 8] = raw.get(offset..offset + 8)?.try_into().ok()?;
@@ -3056,8 +3124,23 @@ impl XrContext {
             },
         };
 
-        // No swapchains (yet): submit with no layers so the runtime keeps pacing.
-        if self.swapchains[0] == XR_NULL_HANDLE || self.swapchains[1] == XR_NULL_HANDLE {
+        // No swapchains (yet), or no eye image was acquired+released this frame (menu/loading frames, session
+        // not ready): submit with no layers so the runtime keeps pacing instead of failing with LAYER_INVALID.
+        let both_released = self.released_eyes == 0b11;
+        {
+            // Evidence counters (one log line per 450 frames): frames handed to xrEndFrame, and how many carried a
+            // projection layer (both eye images acquired, blitted and released).
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static FRAMES: AtomicU64 = AtomicU64::new(0);
+            static LAYERED: AtomicU64 = AtomicU64::new(0);
+            let n = FRAMES.fetch_add(1, Relaxed) + 1;
+            let l = if both_released { LAYERED.fetch_add(1, Relaxed) + 1 } else { LAYERED.load(Relaxed) };
+            if n % 450 == 0 {
+                log::warn!(target: "horizon_vivecraft", "[ViveCraft] xrEndFrame: {n} frames submitted, {l} with a stereo projection layer");
+            }
+        }
+        self.released_eyes = 0;
+        if !both_released || self.swapchains[0] == XR_NULL_HANDLE || self.swapchains[1] == XR_NULL_HANDLE {
             let frame_end_info = XrFrameEndInfo {
                 ty: XrStructureType::FrameEndInfo,
                 next: ptr::null(),
@@ -3082,17 +3165,23 @@ impl XrContext {
             views: views.as_ptr(),
         };
 
+        let layer_ptrs: [*const c_void; 1] = [&projection_layer as *const XrCompositionLayerProjection as *const c_void];
         let frame_end_info = XrFrameEndInfo {
             ty: XrStructureType::FrameEndInfo,
             next: ptr::null(),
             display_time: frame_state.predicted_display_time,
             environment_blend_mode: XrEnvironmentBlendMode::Opaque,
             layer_count: 1,
-            layers: &projection_layer as *const _ as *const *const c_void,
+            // `layers` is an ARRAY OF POINTERS to layer structs (`const XrCompositionLayerBaseHeader* const*`);
+            // passing the address of the layer itself made the runtime read struct bytes as a pointer (SIGSEGV in Monado).
+            layers: layer_ptrs.as_ptr(),
         };
 
         if let Some(end_frame_fn) = procs.end_frame {
-            unsafe { let _ = end_frame_fn(self.session, &frame_end_info); }
+            let res = unsafe { end_frame_fn(self.session, &frame_end_info) };
+            if res < XR_SUCCESS {
+                log::warn!(target: "horizon_vivecraft", "[ViveCraft] xrEndFrame failed: {res}");
+            }
         }
     }
 
