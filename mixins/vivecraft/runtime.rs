@@ -411,6 +411,11 @@ pub fn on_frame(game: &mut Game<'_>, elapsed: Duration) {
         return;
     }
     ensure_settings_loaded(game);
+    // A headset user has no keyboard or mouse: without this the "AFK" limiter caps the game at 30 fps after 60 s
+    // without keyboard/mouse input (measured: 90 fps for 60 s, then exactly 30 fps).
+    if vr::with_runtime(|rt| rt.settings.vr_enabled && rt.xr.is_hardware_connected()) {
+        game.last_input = std::time::Instant::now();
+    }
     // §2.1: keyboard fallback fills the simulated controllers' input fields
     // before every consumer (GUI cursor, radial, locomotion, bow) reads them.
     apply_simulated_controller_fallback(game);

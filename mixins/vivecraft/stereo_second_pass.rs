@@ -17,6 +17,8 @@ fn vivecraft_stereo_second_pass(game: &mut crate::game::Game<'_>) {
             && rt.settings.stereo_rendering
             && rt.xr.eye_textures_ready()
             && !rt.xr.stereo_right_done()
+            // `render()` calls `render_frame()` again: the nested call (eye 1 selected below) must not start another pass.
+            && rt.xr.stereo_eye() == 0
     });
     if !active {
         return;
