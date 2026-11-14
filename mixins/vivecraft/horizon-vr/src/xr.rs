@@ -34,7 +34,10 @@ pub type XrSwapchainUsageFlags = XrFlags64;
 
 pub const XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT: XrSwapchainUsageFlags = 0x00000001;
 pub const XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT: XrSwapchainUsageFlags = 0x00000002;
-pub const XR_SWAPCHAIN_USAGE_SAMPLED_BIT: XrSwapchainUsageFlags = 0x00000008;
+// OpenXR: TRANSFER_SRC = 0x8, TRANSFER_DST = 0x10, SAMPLED = 0x20 (SAMPLED was 0x8, i.e. TRANSFER_SRC, here).
+pub const XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT: XrSwapchainUsageFlags = 0x00000008;
+pub const XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT: XrSwapchainUsageFlags = 0x00000010;
+pub const XR_SWAPCHAIN_USAGE_SAMPLED_BIT: XrSwapchainUsageFlags = 0x00000020;
 
 #[repr(C)]
 pub struct XrSwapchainCreateInfo {
@@ -2808,7 +2811,8 @@ impl XrContext {
             ty: XrStructureType::SwapchainCreateInfo,
             next: ptr::null(),
             create_flags: 0,
-            usage_flags: XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT,
+            // The blit copies into the image (copy_texture_to_texture), so the image must allow TRANSFER_DST.
+            usage_flags: XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
             format,
             sample_count: 1,
             width,
