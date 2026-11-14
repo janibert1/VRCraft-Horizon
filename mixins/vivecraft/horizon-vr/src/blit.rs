@@ -117,7 +117,9 @@ pub unsafe fn blit_into_vk_image(
                 memory_flags: wgpu::hal::MemoryFlags::empty(),
                 view_formats: Vec::new(),
             },
-            None,
+            // A drop callback makes wgpu-hal skip vkDestroyImage (the image belongs to the OpenXR runtime);
+            // `TextureMemory::External` alone only skips the memory free.
+            Some(Box::new(|| {})),
             wgpu::hal::vulkan::TextureMemory::External,
         )
     };
@@ -135,26 +137,14 @@ pub unsafe fn blit_into_vk_image(
                 usage: wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },
-            wgpu::TextureUses::COPY_DST,
+            wgpu::TextureUses::UNINITIALIZED,
         )
     };
 
-    // §2.6: acquired OpenXR swapchain images arrive in UNDEFINED layout;
-    // wgpu's copy_texture_to_texture assumes TRANSFER-compatible layouts and
-    // records no transition for an externally-wrapped image. Transition the
-    // image into TRANSFER_DST_OPTIMAL before the copy — via a raw
-    // vkCmdPipelineBarrier on the same command buffer wgpu records into, so
-    // ordering with the copy (and with the reverse transition below) is
-    // guaranteed within the encoder's submission.
-    unsafe {
-        transition_openxr_image_layout(
-            device,
-            encoder,
-            vk_image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
-    }
+    // Acquired OpenXR swapchain images arrive in UNDEFINED layout. The texture above is wrapped with an UNINITIALIZED
+    // initial state, so wgpu's own tracker inserts the UNDEFINED -> TRANSFER_DST barrier inside its normal encoding.
+    // (A raw `as_hal_mut` barrier on the same encoder panics once wgpu commands were already recorded into it:
+    // "Mixing the wgpu encoding API with the raw encoding API is not permitted".)
 
     // Letterbox the source into the eye image when the aspect ratios differ.
     let scale = {
@@ -187,8 +177,9 @@ pub unsafe fn blit_into_vk_image(
             depth_or_array_layers: 1,
         },
     );
-    // Drop wgpu's wrapper only: the VkImage stays the runtime's.
-    eye_texture.destroy();
+    // `eye_texture` is dropped at the end of this function; wgpu defers the real destruction until the submitted
+    // copy finished, and the no-op drop callback above keeps the VkImage alive for the runtime. (Calling
+    // `destroy()` here invalidated the pending copy and would have destroyed the runtime's image.)
 
     // §2.6 (cont.): transition back to UNDEFINED? No — the OpenXR
     // specification requires the app to leave a swapchain image in
